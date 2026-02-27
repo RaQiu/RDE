@@ -1,11 +1,11 @@
 #!/bin/bash
-root_dir=/home/qinyang/projects/data
+root_dir=/root/dataset/
 tau=0.015 
 margin=0.1
-noisy_rate=0.0  #0.0 0.2 0.5 0.8
+noisy_rate=0.2  #0.0 0.2 0.5 0.8
 select_ratio=0.3
 loss=TAL
-DATASET_NAME=CUHK-PEDES
+DATASET_NAME=ICFG-PEDES
 # CUHK-PEDES ICFG-PEDES RSTPReid
 
 noisy_file=./noiseindex/${DATASET_NAME}_${noisy_rate}.npy
