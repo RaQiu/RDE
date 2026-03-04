@@ -17,6 +17,12 @@ from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
 
+from unified_modality_grad_modulator import (
+    UnifiedModalityGradModulator,
+    UnifiedModulationConfig,
+    HookMode,
+)
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -42,7 +48,7 @@ if __name__ == '__main__':
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
-    
+
     device = "cuda"
     cur_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}_{args.loss_names}')
@@ -56,11 +62,34 @@ if __name__ == '__main__':
 
     # if 'ICFG-PEDES' not in args.dataset_name: #fixed
     #     args.val_dataset = 'val'
-        
+
     train_loader, val_img_loader, val_txt_loader, num_classes = build_dataloader(args)
     model = build_model(args, num_classes)
     logger.info('Total params: %2.fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
     model.to(device)
+
+    # --- Initialize AGM modulator ---
+    agm_config = UnifiedModulationConfig.irra_preset(
+        fig1c_enabled=False,
+        grad_ratio_tracking=False,
+        output_dir=args.output_dir,
+    )
+    modulator = UnifiedModalityGradModulator(agm_config)
+    modulator.attach(
+        model,
+        shared_filter=None,
+        img_enc_filter=lambda name, mod: (
+            name.startswith("base_model.visual") or
+            name.startswith("visul_emb_layer")
+        ),
+        txt_enc_filter=lambda name, mod: (
+            name.startswith("base_model.transformer") or
+            name.startswith("base_model.token_embedding") or
+            name.startswith("base_model.ln_final") or
+            name.startswith("texual_emb_layer")
+        ),
+    )
+    logger.info("AGM modulator attached (PLUGIN mode, no shared cross-modal layers)")
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -84,13 +113,13 @@ if __name__ == '__main__':
         logger.info(f"===================>start {start_epoch}")
 
 
-    do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
-    
+    do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer, modulator=modulator)
+
     # test
     logger.info(f"===================>start test")
     args.training = False
     test_img_loader, test_txt_loader, num_classes = build_dataloader(args)
-    
+
     asss = ['best.pth','last.pth']
     for i in range(len(asss)):
         if os.path.exists(op.join(args.output_dir, asss[i])):
@@ -99,4 +128,3 @@ if __name__ == '__main__':
             checkpointer.load(f=op.join(args.output_dir, asss[i]))
             model = model.cuda()
             do_inference(model, test_img_loader, test_txt_loader)
-     

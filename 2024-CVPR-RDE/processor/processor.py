@@ -124,7 +124,7 @@ def get_loss(model, data_loader):
     for i, batch in enumerate(data_loader):
         batch = {k: v.to(device) for k, v in batch.items()}
         index = batch['index']
-        with torch.no_grad(): 
+        with torch.no_grad():
             la, lb, sa, sb = model.compute_per_loss(batch)
             for b in range(la.size(0)):
                 lossA[index[b]]= la[b]
@@ -134,16 +134,16 @@ def get_loss(model, data_loader):
             if i % 100 == 0:
                 logger.info(f'compute loss batch {i}')
 
-    losses_A = (lossA-lossA.min())/(lossA.max()-lossA.min())    
+    losses_A = (lossA-lossA.min())/(lossA.max()-lossA.min())
     losses_B = (lossB-lossB.min())/(lossB.max()-lossB.min())
-    
-    input_loss_A = losses_A.reshape(-1,1) 
+
+    input_loss_A = losses_A.reshape(-1,1)
     input_loss_B = losses_B.reshape(-1,1)
- 
-    logger.info('\nFitting GMM ...') 
- 
+
+    logger.info('\nFitting GMM ...')
+
     if model.args.noisy_rate > 0.4 or model.args.dataset_name=='RSTPReid':
-        # should have a better fit 
+        # should have a better fit
         gmm_A = GaussianMixture(n_components=2, max_iter=100, tol=1e-4, reg_covar=1e-6)
         gmm_B = GaussianMixture(n_components=2, max_iter=100, tol=1e-4, reg_covar=1e-6)
     else:
@@ -157,18 +157,18 @@ def get_loss(model, data_loader):
     gmm_B.fit(input_loss_B.cpu().numpy())
     prob_B = gmm_B.predict_proba(input_loss_B.cpu().numpy())
     prob_B = prob_B[:, gmm_B.means_.argmin()]
- 
- 
+
+
     pred_A = split_prob(prob_A, 0.5)
     pred_B = split_prob(prob_B, 0.5)
-  
+
     return torch.Tensor(pred_A), torch.Tensor(pred_B)
 
 
 
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
-             scheduler, checkpointer):
+             scheduler, checkpointer, modulator=None):
 
     log_period = args.log_period
     eval_period = args.eval_period
@@ -205,32 +205,67 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         model.epoch = epoch
         # data_size = train_loader.dataset.__len__()
         # pred_A, pred_B  =  torch.ones(data_size), torch.ones(data_size)
-    
+
         pred_A, pred_B = get_loss(model, train_loader)
-    
-        consensus_division = pred_A + pred_B # 0,1,2 
+
+        consensus_division = pred_A + pred_B # 0,1,2
         consensus_division[consensus_division==1] += torch.randint(0, 2, size=(((consensus_division==1)+0).sum(),))
         label_hat = consensus_division.clone()
         label_hat[consensus_division>1] = 1
-        label_hat[consensus_division<=1] = 0 
-        
-        model.train() 
+        label_hat[consensus_division<=1] = 0
+
+        model.train()
+
+        # AGM: epoch start
+        if modulator is not None:
+            modulator.on_epoch_start(model)
+
+        n_batches = len(train_loader)
+
         for n_iter, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             index = batch['index']
-            
+
             batch['label_hat'] = label_hat[index.cpu()]
- 
+
+            # AGM: pre-forward + normal forward + capture
+            if modulator is not None:
+                modulator.pre_forward(model)
+
             ret = model(batch)
             total_loss = sum([v for k, v in ret.items() if "loss" in k])
+
+            if modulator is not None:
+                modulator.capture('normal', model)
+
+                # AGM: erased forward passes
+                with torch.no_grad():
+                    modulator.pre_forward(model)
+                    e_img_ret = model(batch, type='E_IMG')
+                    modulator.capture('e_img', model)
+
+                    modulator.pre_forward(model)
+                    e_txt_ret = model(batch, type='E_TXT')
+                    modulator.capture('e_txt', model)
+
+                e_img_loss = sum([v for k, v in e_img_ret.items() if "loss" in k]).item()
+                e_txt_loss = sum([v for k, v in e_txt_ret.items() if "loss" in k]).item()
 
             batch_size = batch['images'].shape[0]
             meters['loss'].update(total_loss.item(), batch_size)
             meters['bge_loss'].update(ret.get('bge_loss', 0), batch_size)
             meters['tse_loss'].update(ret.get('tse_loss', 0), batch_size)
-         
+
             optimizer.zero_grad()
             total_loss.backward()
+
+            # AGM: post-backward gradient modulation
+            if modulator is not None:
+                modulator.post_backward(
+                    model, n_iter, n_batches, batch_size,
+                    total_loss.item(), e_txt_loss, e_img_loss,
+                )
+
             optimizer.step()
             synchronize()
 
@@ -242,8 +277,13 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                         info_str += f", {k}: {v.avg:.4f}"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
-        
- 
+
+        # AGM: epoch end
+        if modulator is not None:
+            agm_info = modulator.on_epoch_end(model, epoch)
+            if agm_info:
+                logger.info(f"AGM epoch {epoch} stats:\n{agm_info}")
+
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar('temperature', ret['temperature'], epoch)
         for k, v in meters.items():
@@ -271,13 +311,13 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     best_top1 = top1
                     arguments["epoch"] = epoch
                     checkpointer.save("best", **arguments)
- 
+
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
 
     arguments["epoch"] = epoch
     checkpointer.save("last", **arguments)
-                    
+
 def do_inference(model, test_img_loader, test_txt_loader):
 
     logger = logging.getLogger("RDE.test")
